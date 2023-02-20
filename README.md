@@ -28,6 +28,9 @@ See `benchmark.py` to run kernel benchmarks
 ![alt text](https://github.com/aranku/triton_testing/blob/main/images/query-norm-backward.png)
 
 ### Fused QueryNorm + Multiquery Attention vs Unfused QueryNorm + Multiquery Attention
+
+Backward pass remains unfused due to minimal gains from fusing forward pass
+
 #### Forward pass
 
 ![alt text](https://github.com/aranku/triton_testing/blob/main/images/fused_multiquery_querynorm-fwd.png)
