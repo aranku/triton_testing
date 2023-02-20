@@ -8,8 +8,6 @@ def _fwd_querynorm_kernel(
     Y,  # pointer to the output
     W,  # pointer to the weights
     B,  # pointer to the biases
-    Mean,  # pointer to the mean
-    Rstd,  # pointer to the 1/std
     stride,  # how much to increase the pointer when moving by 1 row
     N,  # number of columns in X
     L, # sequence length
@@ -21,43 +19,22 @@ def _fwd_querynorm_kernel(
     row = tl.program_id(0)
     Y += row * stride
     X += row * stride
-
-    # Compute mean
-    mean = 0
-    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        a = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-        _mean += a
-    mean = tl.sum(_mean, axis=0) / N
-    # Compute variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        x = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-        x = tl.where(cols < N, x - mean, 0.)
-        _var += x * x
-    var = tl.sum(_var, axis=0) / N
-    rstd = 1 / tl.sqrt(var + eps)
+    cols = tl.arange(0, BLOCK_SIZE)
+    
+    # Calculate statistics
+    x = tl.load(X + cols, mask = cols < N, other=0.).to(tl.float32)
+    mean = tl.sum(x, axis=0) / N
+    x_zm = tl.where(cols < N, x - mean, 0.0)
+    x_var = tl.sum(x_zm * x_zm, axis=0) / N
+    rstd = 1.0 / tl.sqrt(x_var + eps)
 
     curr_head = row // L % H
-
-    # Write mean / rstd
-    tl.store(Mean + row, mean)
-    tl.store(Rstd + row, rstd)
-
     w = tl.load(W + curr_head)
     b = tl.load(B + curr_head)
-
-    # Normalize and apply linear transformation
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
-        x_hat = (x - mean) * rstd
-        y = x_hat * w + b
-        # Write output
-        tl.store(Y + cols, y, mask=mask)
+    
+    x_hat = (x - mean) * rstd
+    y = x_hat * w + b
+    tl.store(Y + cols, y, mask=cols < N)
 
 @triton.jit
 def _querynorm_bwd_dx_fused(
@@ -68,8 +45,6 @@ def _querynorm_bwd_dx_fused(
     X,   # pointer to the input
     W,   # pointer to the weights
     B,   # pointer to the biases
-    Mean,   # pointer to the mean
-    Rstd,   # pointer to the 1/std
     x_stride,  # how much to increase the pointer when moving by 1 row of x
     dw_stride, # how much to increase the pointer when moving by 1 row of dw
     N,  # number of columns in X
@@ -96,8 +71,14 @@ def _querynorm_bwd_dx_fused(
     x = tl.load(X + cols_n, mask=mask_n, other=0).to(tl.float32)
     dy = tl.load(DY + cols_n, mask=mask_n, other=0).to(tl.float32)
     w = tl.load(W + curr_head).to(tl.float32)
-    mean = tl.load(Mean + row) # can recompute
-    rstd = tl.load(Rstd + row) # can recompute
+    
+    # Calculate statistics
+    x = tl.load(X + cols_n, mask=mask_n, other=0.).to(tl.float32)
+    mean = tl.sum(x, axis=0) / N
+    x_zm = tl.where(mask_n, x - mean, 0.0)
+    x_var = tl.sum(x_zm * x_zm, axis=0) / N
+    rstd = 1.0 / tl.sqrt(x_var + eps)
+    
     # Compute dx
     xhat = (x - mean) * rstd
     wdy = w * dy
@@ -153,8 +134,6 @@ class FusedQueryNorm(torch.autograd.Function):
         # reshape input data into 2D tensor
         x_arg = x.reshape(-1, N)
         M, N = x_arg.shape
-        mean = torch.empty((M, ), dtype=torch.float32, device='cuda')
-        rstd = torch.empty((M, ), dtype=torch.float32, device='cuda')
         # Less than 64KB per feature: enqueue fused kernel
         MAX_FUSED_SIZE = 65536 // x.element_size()
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
@@ -163,10 +142,10 @@ class FusedQueryNorm(torch.autograd.Function):
         # heuristics for number of warps
         num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
         # enqueue kernel
-        _fwd_querynorm_kernel[(M,)](x_arg, y, weight, bias, mean, rstd,
+        _fwd_querynorm_kernel[(M,)](x_arg, y, weight, bias,
                                   x_arg.stride(0), N, L, H, eps,
                                   BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps)
-        ctx.save_for_backward(x, weight, bias, mean, rstd)
+        ctx.save_for_backward(x, weight, bias)
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.eps = eps
@@ -174,7 +153,7 @@ class FusedQueryNorm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy):
-        x, weight, bias, mean, rstd = ctx.saved_tensors
+        x, weight, bias = ctx.saved_tensors
         # heuristics for amount of parallel reduction stream for DW/DB
         L = x.shape[2]
         H = weight.shape[0]
@@ -186,7 +165,7 @@ class FusedQueryNorm(torch.autograd.Function):
         _dw = torch.empty((H, M//H), dtype=x.dtype, device=weight.device)
         _db = torch.empty((H, M//H), dtype=x.dtype, device=weight.device)
         dx = torch.empty_like(dy)
-        _querynorm_bwd_dx_fused[(M,)](dx, dy, _dw, _db, x, weight, bias, mean, rstd,
+        _querynorm_bwd_dx_fused[(M,)](dx, dy, _dw, _db, x, weight, bias,
                                         x_arg.stride(0), _dw.stride(0), N, L, H, ctx.eps,
                                         BLOCK_SIZE_N=ctx.BLOCK_SIZE,
                                         num_warps=ctx.num_warps)

@@ -128,13 +128,13 @@ def _bwd_kernel(
         lo = start_n * BLOCK_M
         # initialize row/col offsets
         offs_qm = lo + tl.arange(0, BLOCK_M)
-        offs_n = start_n * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_m = tl.arange(0, BLOCK_N)
+        offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_m = tl.arange(0, BLOCK_M)
         offs_k = tl.arange(0, BLOCK_DMODEL)
         # initialize pointers to value-like data
         q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-        v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        v_ptrs = V + (offs_n[:, None] * stride_vk + offs_k[None, :] * stride_vn)
         do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
         # pointer to row-wise quantities in value-like data
@@ -177,13 +177,10 @@ def _bwd_kernel(
             q_ptrs += BLOCK_M * stride_qm
             do_ptrs += BLOCK_M * stride_qm
         # write-back
-        dv_ptrs = DV + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        dv_ptrs = DV + (offs_n[:, None] * stride_vk + offs_k[None, :] * stride_vn)
         dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         tl.store(dv_ptrs, dv)
         tl.store(dk_ptrs, dk)
-
-
-empty = torch.empty(128, device="cuda")
 
 
 class MultiHeadAttention(torch.autograd.Function):

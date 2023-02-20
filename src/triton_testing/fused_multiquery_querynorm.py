@@ -2,11 +2,15 @@ import torch
 import triton
 import triton.language as tl
 
+from triton_testing.multiquery_attention import _bwd_multiquery_preprocess, _bwd_multiquery_kernel
+from triton_testing.query_norm import _querynorm_bwd_dx_fused, _querynorm_bwd_dwdb
+
 @triton.jit
-def _fwd_multiquery_kernel(
+def _fwd_multiquery_querynorm_kernel(
     Q, K, V, sm_scale, n_heads,
     L, M,
     Out,
+    weight, bias, eps,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kn, stride_kk,
     stride_vz, stride_vk, stride_vn,
@@ -33,8 +37,20 @@ def _fwd_multiquery_kernel(
     m_prev = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_prev = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    # load q: it will stay in SRAM throughout
-    q = tl.load(q_ptrs)
+    
+    # Query norm
+    q_unscaled = tl.load(q_ptrs)
+    q_mean = tl.sum(q_unscaled, axis=1) / stride_qm
+    q_zero_mean = q_unscaled-q_mean
+    q_var = tl.sum(q_zero_mean*q_zero_mean, axis=1) / stride_qm
+    q_rstd = 1 / tl.sqrt(q_var + eps)
+    curr_head = off_hz%n_heads
+    w = tl.load(weight + curr_head)
+    b = tl.load(bias + curr_head)
+    q_hat = (q_unscaled - q_mean) * q_rstd
+    q = q_hat * w + b
+    q = q.to(tl.float16)
+    
     # loop over k, v and update accumulator
     for start_n in range(0, (start_m + 1) * BLOCK_M, BLOCK_N):
         # -- compute qk ----
@@ -77,119 +93,11 @@ def _fwd_multiquery_kernel(
     off_o = off_hz * stride_oh + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
     out_ptrs = Out + off_o
     tl.store(out_ptrs, acc)
-
-@triton.jit
-def _bwd_multiquery_preprocess(
-    Out, DO, L,
-    NewDO, Delta,
-    BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
-):
-    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    off_n = tl.arange(0, D_HEAD)
-    # load
-    o = tl.load(Out + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
-    do = tl.load(DO + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
-    denom = tl.load(L + off_m).to(tl.float32)
-    # compute
-    do = do / denom[:, None]
-    delta = tl.sum(o * do, axis=1)
-    # write-back
-    tl.store(NewDO + off_m[:, None] * D_HEAD + off_n[None, :], do)
-    tl.store(Delta + off_m, delta)
-
-
-@triton.jit
-def _bwd_multiquery_kernel(
-    Q, K, V, sm_scale, Out, DO,
-    DQ, DK, DV,
-    L, M,
-    D, Lock,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kn, stride_kk,
-    stride_vz, stride_vk, stride_vn,
-    Z, H, N_CTX,
-    num_block,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    off_hz = tl.program_id(0)
-    start_n = tl.program_id(1)
-    off_z = off_hz // H
     
-    Lock += start_n
-    # offset pointers for batch/head
-    Q += off_hz * stride_qh
-    K += off_z * stride_kz
-    V += off_z * stride_vz
-    DO += off_hz * stride_qh
-    DQ += off_hz * stride_qh
-    DK += off_z * stride_kz
-    DV += off_z * stride_vz
-    lo = start_n * BLOCK_M
-    # initialize row/col offsets
-    offs_qm = lo + tl.arange(0, BLOCK_M)
-    offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, BLOCK_DMODEL)
-    # initialize pointers to value-like data
-    q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-    v_ptrs = V + (offs_n[:, None] * stride_vk + offs_k[None, :] * stride_vn)
-    do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-    dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-    # pointer to row-wise quantities in value-like data
-    D_ptrs = D + off_hz * N_CTX
-    m_ptrs = M + off_hz * N_CTX
-    # initialize dv amd dk
-    dv = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    # k and v stay in SRAM throughout
-    k = tl.load(k_ptrs)
-    v = tl.load(v_ptrs)
-    for start_m in range(lo, num_block * BLOCK_M, BLOCK_M):
-        offs_m_curr = start_m + offs_m
-        # load q, k, v, do on-chip
-        q = tl.load(q_ptrs)
-        # recompute p = softmax(qk, dim=-1).T
-        # NOTE: `do` is pre-divided by `l`; no normalization here
-        qk = tl.dot(q, tl.trans(k))
-        qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
-        m = tl.load(m_ptrs + offs_m_curr)
-        p = tl.exp(qk * sm_scale - m[:, None])
-        # compute dv
-        do = tl.load(do_ptrs)
-        dv += tl.dot(tl.trans(p.to(tl.float16)), do)
-        # compute dp = dot(v, do)
-        Di = tl.load(D_ptrs + offs_m_curr)
-        dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
-        dp += tl.dot(do, tl.trans(v))
-        # compute ds = p * (dp - delta[:, None])
-        ds = p * dp * sm_scale
-        # compute dk = dot(ds.T, q)
-        dk += tl.dot(tl.trans(ds.to(tl.float16)), q)
-        # compute dq
-        dq = tl.load(dq_ptrs)
-        dq += tl.dot(ds.to(tl.float16), k)
-        tl.store(dq_ptrs, dq)
-        # increment pointers
-        dq_ptrs += BLOCK_M * stride_qm
-        q_ptrs += BLOCK_M * stride_qm
-        do_ptrs += BLOCK_M * stride_qm
-    # write-back
-    dv_ptrs = DV + (offs_n[:, None] * stride_vk + offs_k[None, :] * stride_vn)
-    dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
-    while tl.atomic_cas(Lock, 0, 1) == 1:
-        pass
-    dv += tl.load(dv_ptrs)
-    dk += tl.load(dk_ptrs)
-    tl.store(dv_ptrs, dv)
-    tl.store(dk_ptrs, dk)
-    tl.atomic_xchg(Lock, 0)
-
-class MultiQueryAttention(torch.autograd.Function):
+class MultiqueryQueryNormAttention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v):
+    def forward(ctx, q, k, v, weight, bias, eps):
         BLOCK = 128
         # shape constraints
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -202,11 +110,10 @@ class MultiQueryAttention(torch.autograd.Function):
         L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         m = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         num_warps = 4 if Lk <= 64 else 8
-
-        _fwd_multiquery_kernel[grid](
+        _fwd_multiquery_querynorm_kernel[grid](
             q, k, v, sm_scale, n_heads,
             L, m,
-            o,
+            o, weight, bias, eps,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
@@ -216,18 +123,19 @@ class MultiQueryAttention(torch.autograd.Function):
             BLOCK_DMODEL=Lk, num_warps=num_warps,
             num_stages=2,
         )
-        ctx.save_for_backward(q, k, v, o, L, m)
+        ctx.save_for_backward(q, k, v, o, L, m, weight, bias)
         ctx.grid = grid
+        ctx.eps = eps
         ctx.sm_scale = sm_scale
         ctx.BLOCK_DMODEL = Lk
         return o
-
+    
     @staticmethod
     def backward(ctx, do):
         BLOCK = 128
-        q, k, v, o, l, m = ctx.saved_tensors
+        q, k, v, o, l, m, weight, bias = ctx.saved_tensors
         do = do.contiguous()
-        dq = torch.zeros_like(q, dtype=torch.float32)
+        dq1 = torch.zeros_like(q, dtype=torch.float32)
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
         locks = torch.zeros(ctx.grid[0], dtype=torch.int32, device='cuda')
@@ -241,7 +149,7 @@ class MultiQueryAttention(torch.autograd.Function):
         _bwd_multiquery_kernel[(ctx.grid[1],ctx.grid[0])](
             q, k, v, ctx.sm_scale,
             o, do_scaled,
-            dq, dk, dv,
+            dq1, dk, dv,
             l, m,
             delta, locks,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -253,7 +161,36 @@ class MultiQueryAttention(torch.autograd.Function):
             BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
             num_stages=1,
         )
-        return dq, dk, dv
+        
+        # heuristics for amount of parallel reduction stream for DW/DB
+        L = q.shape[2]
+        H = weight.shape[0]
+        # enqueue kernel using forward pass heuristics
+        # also compute partial sums for DW and DB
+        q_arg = q.reshape(-1, q.shape[-1])
+        M, N = q_arg.shape
+        # Less than 64KB per feature: enqueue fused kernel
+        MAX_FUSED_SIZE = 65536 // q.element_size()
+        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
+        if N > BLOCK_SIZE:
+            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        # heuristics for number of warps
+        num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+        # allocate output
+        _dw = torch.empty((H, M//H), dtype=q.dtype, device=weight.device)
+        _db = torch.empty((H, M//H), dtype=q.dtype, device=weight.device)
+        dq2 = torch.empty_like(dq1)
+        _querynorm_bwd_dx_fused[(M,)](dq2, dq1, _dw, _db, q, weight, bias,
+                                        q_arg.stride(0), _dw.stride(0), N, L, H, ctx.eps,
+                                        BLOCK_SIZE_N=BLOCK_SIZE,
+                                        num_warps=num_warps)
+        dw = torch.empty((H,), dtype=weight.dtype, device=weight.device)
+        db = torch.empty((H,), dtype=weight.dtype, device=weight.device)
+        # accumulate partial sums in separate kernel
+        _querynorm_bwd_dwdb[(H,)](_dw, _db, dw, db, M, H, _dw.stride(0),
+                                    BLOCK_SIZE=32)
+        
+        return dq2, dk, dv, dw, db, None
 
 
-multiquery_flash_attention = MultiQueryAttention.apply
+multiquery_querynorm_flash_attention = MultiqueryQueryNormAttention.apply
