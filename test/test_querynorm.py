@@ -28,4 +28,7 @@ def test_querynorm_op(BATCH, H, N_CTX, D_HEAD, dtype=torch.float16):
     dq_ref, dw_ref, db_ref = [_.grad.clone() for _ in [q, w, b]]
     # compare
     triton.testing.assert_almost_equal(naive_out, tri_out)
+    triton.testing.assert_almost_equal(dq_tri, dq_ref)
+    triton.testing.assert_almost_equal(db_tri, db_ref, decimal=1)
+    triton.testing.assert_almost_equal(dw_tri, dw_ref, decimal=1)
     print("Passed all equality checks")
