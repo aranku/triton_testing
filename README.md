@@ -8,7 +8,7 @@ then run `pip install -e .`
 
 ## Tests
 
-Run pytests to check for equality between triton kernels and reference implementation
+Run pytests to check for equality between triton kernels and reference implementation. Only tested on an A100 gpu.
 
 ## Benchmarks
 
