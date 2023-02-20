@@ -189,9 +189,10 @@ empty = torch.empty(128, device="cuda")
 class MultiHeadAttention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, sm_scale):
+    def forward(ctx, q, k, v):
         BLOCK = 128
         # shape constraints
+        sm_scale = q.shape[-1]**-0.5
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv
         assert Lk in {16, 32, 64, 128}
