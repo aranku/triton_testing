@@ -129,68 +129,6 @@ class MultiqueryQueryNormAttention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.BLOCK_DMODEL = Lk
         return o
-    
-    @staticmethod
-    def backward(ctx, do):
-        BLOCK = 128
-        q, k, v, o, l, m, weight, bias = ctx.saved_tensors
-        do = do.contiguous()
-        dq1 = torch.zeros_like(q, dtype=torch.float32)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        locks = torch.zeros(ctx.grid[0], dtype=torch.int32, device='cuda')
-        do_scaled = torch.empty_like(do)
-        delta = torch.empty_like(l)
-        _bwd_multiquery_preprocess[(ctx.grid[0] * ctx.grid[1], )](
-            o, do, l,
-            do_scaled, delta,
-            BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
-        )
-        _bwd_multiquery_kernel[(ctx.grid[1],ctx.grid[0])](
-            q, k, v, ctx.sm_scale,
-            o, do_scaled,
-            dq1, dk, dv,
-            l, m,
-            delta, locks,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            q.shape[0], q.shape[1], q.shape[2],
-            ctx.grid[0], 
-            BLOCK_M=BLOCK, BLOCK_N=BLOCK,
-            BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
-            num_stages=1,
-        )
-        
-        # heuristics for amount of parallel reduction stream for DW/DB
-        L = q.shape[2]
-        H = weight.shape[0]
-        # enqueue kernel using forward pass heuristics
-        # also compute partial sums for DW and DB
-        q_arg = q.reshape(-1, q.shape[-1])
-        M, N = q_arg.shape
-        # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // q.element_size()
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-        if N > BLOCK_SIZE:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-        # heuristics for number of warps
-        num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
-        # allocate output
-        _dw = torch.empty((H, M//H), dtype=q.dtype, device=weight.device)
-        _db = torch.empty((H, M//H), dtype=q.dtype, device=weight.device)
-        dq2 = torch.empty_like(dq1)
-        _querynorm_bwd_dx_fused[(M,)](dq2, dq1, _dw, _db, q, weight, bias,
-                                        q_arg.stride(0), _dw.stride(0), N, L, H, ctx.eps,
-                                        BLOCK_SIZE_N=BLOCK_SIZE,
-                                        num_warps=num_warps)
-        dw = torch.empty((H,), dtype=weight.dtype, device=weight.device)
-        db = torch.empty((H,), dtype=weight.dtype, device=weight.device)
-        # accumulate partial sums in separate kernel
-        _querynorm_bwd_dwdb[(H,)](_dw, _db, dw, db, M, H, _dw.stride(0),
-                                    BLOCK_SIZE=32)
-        
-        return dq2, dk, dv, dw, db, None
 
 
 multiquery_querynorm_flash_attention = MultiqueryQueryNormAttention.apply

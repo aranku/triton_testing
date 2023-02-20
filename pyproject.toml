@@ -3,7 +3,7 @@ name = "triton_testing"
 description = "Testing OpenAI Triton Kernels"
 version = "0.1.0"
 authors = []
-dependencies = []
+dependencies = ["pytest"]
 
 [project.optional-dependencies]
 dev = []
