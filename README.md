@@ -6,6 +6,9 @@ Install triton from source https://triton-lang.org/master/getting-started/instal
 
 then run `pip install -e .`
 
+## Tests
+
+Run pytests to check for equality between triton kernels and reference implementation
 
 ## Benchmarks
 
@@ -34,6 +37,3 @@ Backward pass remains unfused due to minimal gains from fusing forward pass
 #### Forward pass
 
 ![alt text](https://github.com/aranku/triton_testing/blob/main/images/fused_multiquery_querynorm-fwd.png)
-#### Backward pass
-
-![alt text](https://github.com/aranku/triton_testing/blob/main/images/fused_multiquery_querynorm-bwd.png)
