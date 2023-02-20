@@ -1,0 +1,13 @@
+[project]
+name = "triton_testing"
+description = "Testing OpenAI Triton Kernels"
+version = "0.1.0"
+authors = []
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
