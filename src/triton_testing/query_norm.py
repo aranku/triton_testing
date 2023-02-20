@@ -15,26 +15,29 @@ def _fwd_querynorm_kernel(
     eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr # feature size to next power of 2
     ):
-    # Map the program id to the row of X and Y it should compute.
+    # Map the program id to the row of X and Y it should compute. 
     row = tl.program_id(0)
-    Y += row * stride
-    X += row * stride
     cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
     
-    # Calculate statistics
-    x = tl.load(X + cols, mask = cols < N, other=0.).to(tl.float32)
-    mean = tl.sum(x, axis=0) / N
-    x_zm = tl.where(cols < N, x - mean, 0.0)
-    x_var = tl.sum(x_zm * x_zm, axis=0) / N
-    rstd = 1.0 / tl.sqrt(x_var + eps)
-
+    x_ptrs = X + row * stride + cols
+    x = tl.load(x_ptrs, mask=mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
     curr_head = row // L % H
     w = tl.load(W + curr_head)
     b = tl.load(B + curr_head)
     
-    x_hat = (x - mean) * rstd
-    y = x_hat * w + b
-    tl.store(Y + cols, y, mask=cols < N)
+    # Compute mean and variance
+    mean = tl.sum(x, axis=0) / N
+    x_zm = tl.where(mask, x - mean, 0.0)
+    x_var = tl.sum(x_zm * x_zm, axis=0) / N
+    rstd = 1.0 / tl.sqrt(x_var + eps)
+
+    # Normalize
+    y = x_zm * rstd
+    
+    y = y * w + b
+    y_ptrs = Y + row * stride + cols
+    tl.store(y_ptrs, y, mask=mask)
 
 @triton.jit
 def _querynorm_bwd_dx_fused(
@@ -55,40 +58,38 @@ def _querynorm_bwd_dx_fused(
 ):
     # Map the program id to the elements of X, DX, and DY it should compute.
     row = tl.program_id(0)
-    cols_n = tl.arange(0, BLOCK_SIZE_N)
-    mask_n = cols_n < N
-
+    cols = tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < N
     curr_head = row // L % H
-
-    X += row * x_stride
-    DY += row * x_stride
-    DX += row * x_stride
+    
+    X += row * x_stride + cols
+    DY += row * x_stride + cols
+    DX += row * x_stride + cols
     
     DW += curr_head*dw_stride + row%dw_stride
     DB += curr_head*dw_stride + row%dw_stride
     
     # Load data to SRAM
-    x = tl.load(X + cols_n, mask=mask_n, other=0).to(tl.float32)
-    dy = tl.load(DY + cols_n, mask=mask_n, other=0).to(tl.float32)
+    x = tl.load(X, mask=mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
+    dy = tl.load(DY, mask=mask, other=0).to(tl.float32)
     w = tl.load(W + curr_head).to(tl.float32)
     
-    # Calculate statistics
-    x = tl.load(X + cols_n, mask=mask_n, other=0.).to(tl.float32)
+    # Compute mean and variance
     mean = tl.sum(x, axis=0) / N
-    x_zm = tl.where(mask_n, x - mean, 0.0)
+    x_zm = tl.where(mask, x - mean, 0.0)
     x_var = tl.sum(x_zm * x_zm, axis=0) / N
     rstd = 1.0 / tl.sqrt(x_var + eps)
     
     # Compute dx
-    xhat = (x - mean) * rstd
+    xhat = (x - mean)*rstd
     wdy = w * dy
-    xhat = tl.where(mask_n, xhat, 0.)
-    wdy = tl.where(mask_n, wdy, 0.)
+    xhat = tl.where(mask, xhat, 0.)
+    wdy = tl.where(mask, wdy, 0.)
     c1 = tl.sum(xhat * wdy, axis=0) / N
     c2 = tl.sum(wdy, axis=0) / N
-    dx = (wdy - (xhat * c1 + c2)) * rstd
+    dx = (wdy - (xhat * c1 + c2))*rstd
     # Write dx
-    tl.store(DX + cols_n, dx, mask=mask_n)
+    tl.store(DX, dx, mask=mask)
     
     # Accumulate partial sums for dw/db
     partial_dw = tl.sum((dy * xhat).to(w.dtype), axis=0)
